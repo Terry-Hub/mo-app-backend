@@ -10,11 +10,21 @@ const JWT_SECRET = process.env.JWT_SECRET || "dev-secret";
 const JWT_REFRESH_SECRET =
   process.env.JWT_REFRESH_SECRET || "dev-refresh-secret";
 
-// Client Twilio (pour SMS OTP)
-const twilioClient =
-  process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
-    ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
-    : null;
+// Client Twilio (pour SMS OTP) - SAFE (ne doit jamais faire crasher le serveur)
+let twilioClient = null;
+try {
+  const sid = process.env.TWILIO_ACCOUNT_SID;
+  const token = process.env.TWILIO_AUTH_TOKEN;
+
+  if (sid && token && sid.startsWith("AC")) {
+    twilioClient = twilio(sid, token);
+  } else {
+    console.log("⚠️ Twilio désactivé (TWILIO_ACCOUNT_SID invalide ou manquant).");
+  }
+} catch (e) {
+  console.log("⚠️ Twilio désactivé (erreur init):", e?.message || e);
+  twilioClient = null;
+}
 
 /**
  * Génère un access token (valable 15 minutes)
