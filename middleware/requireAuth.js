@@ -1,6 +1,7 @@
 const jwt = require("jsonwebtoken");
+const User = require("../models/User");
 
-module.exports = function auth(req, res, next) {
+module.exports = async function requireAuth(req, res, next) {
   try {
     const authHeader = req.headers.authorization;
 
@@ -9,17 +10,21 @@ module.exports = function auth(req, res, next) {
     }
 
     const token = authHeader.split(" ")[1];
-
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const userId = decoded?.userId;
 
+    const userId = decoded?.userId;
     if (!userId) {
       return res.status(401).json({ error: "Token invalide." });
     }
 
-    req.userId = userId;
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(401).json({ error: "Utilisateur introuvable." });
+    }
+
+    req.user = { id: user._id };
     next();
-  } catch (e) {
+  } catch (err) {
     return res.status(401).json({ error: "Authentification invalide." });
   }
 };

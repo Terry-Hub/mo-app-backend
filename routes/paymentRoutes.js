@@ -1,36 +1,40 @@
 const express = require("express");
 const router = express.Router();
 
-const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
+const auth = require("../middleware/auth");
 
-// Stripe devient optionnel
+const stripeSecretKey = process.env.STRIPE_SECRET_KEY;
 const stripe = stripeSecretKey ? require("stripe")(stripeSecretKey) : null;
 
-// Si Stripe n'est pas configuré, on renvoie une erreur propre
-router.post("/create-payment-intent", async (req, res) => {
+router.post("/create-payment-intent", auth, async (req, res) => {
   try {
     if (!stripe) {
-      return res.status(503).json({
-        error: "Stripe non configuré (STRIPE_SECRET_KEY manquante).",
-      });
+      return res.status(503).json({ error: "Stripe non configuré (STRIPE_SECRET_KEY manquante)." });
     }
 
     const { amount, currency = "eur" } = req.body;
 
-    if (!amount || typeof amount !== "number") {
+    if (typeof amount !== "number" || !Number.isFinite(amount) || amount <= 0) {
       return res.status(400).json({ error: "Montant invalide." });
     }
 
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount,
+    // euros -> centimes
+    const amountInCents = Math.round(amount * 100);
+    if (amountInCents < 50) {
+      return res.status(400).json({ error: "Montant minimum 0,50 €." });
+    }
+
+    const pi = await stripe.paymentIntents.create({
+      amount: amountInCents,
       currency,
       automatic_payment_methods: { enabled: true },
+      metadata: { userId: String(req.userId) },
     });
 
-    return res.json({ clientSecret: paymentIntent.client_secret });
+    return res.json({ clientSecret: pi.client_secret, paymentIntentId: pi.id });
   } catch (err) {
     console.error("❌ Stripe error:", err);
-    return res.status(500).json({ error: "Erreur Stripe." });
+    return res.status(500).json({ error: "Erreur Stripe.", details: err.message });
   }
 });
 

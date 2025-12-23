@@ -2,7 +2,7 @@ const express = require("express");
 const router = express.Router();
 
 const User = require("../models/User");
-const Transaction = require("../models/transaction");
+const Transaction = require("../models/transaction"); // ✅ FIX ICI
 const auth = require("../middleware/auth");
 
 // Réponse erreur JSON cohérente
@@ -27,7 +27,7 @@ router.get("/summary", auth, async (req, res) => {
       .limit(50)
       .lean();
 
-    // Dans ta DB: type=credit/debit, amount stocké en positif.
+    // type=credit/debit, amount stocké en positif.
     const balance = transactions.reduce((acc, t) => {
       return t.type === "credit" ? acc + t.amount : acc - t.amount;
     }, 0);
@@ -51,13 +51,16 @@ router.get("/summary", auth, async (req, res) => {
  * POST /api/account/deposit
  * Body : { amount, currency?, method?, option? }
  * Crée un crédit pour l'utilisateur connecté
+ *
+ * ⚠️ Pour Stripe en prod: ne pas appeler cette route depuis le front.
+ * Le crédit Stripe doit venir du webhook.
  */
 router.post("/deposit", auth, async (req, res) => {
   try {
     const { amount, currency = "EUR", method, option } = req.body;
     const val = Number(amount);
 
-    if (!val || val <= 0) return jsonError(res, 400, "Montant invalide.");
+    if (!Number.isFinite(val) || val <= 0) return jsonError(res, 400, "Montant invalide.");
 
     const user = await getUserFromReq(req);
     if (!user) return jsonError(res, 401, "Utilisateur introuvable.");
@@ -70,8 +73,6 @@ router.post("/deposit", auth, async (req, res) => {
       label: method ? `Dépôt via ${method}${option ? ` (${option})` : ""}` : "Dépôt",
     });
 
-    // Optionnel: renvoyer le nouvel état
-    // const summary = await ... (mais on reste simple)
     return res.json({ ok: true });
   } catch (e) {
     console.error("❌ deposit error:", e);
@@ -89,8 +90,8 @@ router.post("/transfer", auth, async (req, res) => {
     const { recipient, amount, currency = "EUR", label } = req.body;
     const val = Number(amount);
 
-    if (!val || val <= 0) return jsonError(res, 400, "Montant invalide.");
-    if (!recipient) return jsonError(res, 400, "Destinataire requis.");
+    if (!Number.isFinite(val) || val <= 0) return jsonError(res, 400, "Montant invalide.");
+    if (!recipient || !String(recipient).trim()) return jsonError(res, 400, "Destinataire requis.");
 
     const user = await getUserFromReq(req);
     if (!user) return jsonError(res, 401, "Utilisateur introuvable.");
