@@ -19,14 +19,11 @@ const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || "dev-refresh-secret
 // --- Helpers ---
 function normalizePhoneFR(input) {
   if (!input) return null;
-  const raw = String(input)
-    .trim()
-    .replace(/[\s\-().]/g, ""); // ✅ plus robuste (enlève espaces/tirets/parenthèses)
+  const raw = String(input).trim().replace(/\s+/g, "");
 
   if (raw.startsWith("+")) return raw;
   if (raw.startsWith("00")) return `+${raw.slice(2)}`;
   if (/^0\d{9}$/.test(raw)) return `+33${raw.slice(1)}`;
-  if (/^33\d{8,}$/.test(raw)) return `+${raw}`; // ✅ si "33..." sans "+"
   return raw;
 }
 
@@ -42,37 +39,23 @@ const generateRefreshToken = (userId) =>
 
 // --- Twilio init ---
 let twilioClient = null;
-
 function isTwilioConfigured() {
   const sid = process.env.TWILIO_ACCOUNT_SID;
   const token = process.env.TWILIO_AUTH_TOKEN;
   const from = process.env.TWILIO_PHONE_NUMBER;
-  return Boolean(sid && token && from && String(sid).startsWith("AC"));
+  return Boolean(sid && token && from && sid.startsWith("AC"));
 }
 
 try {
   if (isTwilioConfigured()) {
     twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-    console.log("✅ Twilio activé (Messaging) - from:", process.env.TWILIO_PHONE_NUMBER);
+    console.log("✅ Twilio activé");
   } else {
     console.log("⚠️ Twilio désactivé (variables manquantes ou invalides).");
   }
 } catch (e) {
   console.log("⚠️ Twilio désactivé (erreur init):", e?.message || e);
   twilioClient = null;
-}
-
-function logTwilioError(prefix, err) {
-  // Twilio errors have: status, code, moreInfo, details
-  const payload = {
-    message: err?.message,
-    status: err?.status,
-    code: err?.code,
-    moreInfo: err?.moreInfo,
-    details: err?.details,
-  };
-  console.error(prefix, payload);
-  return payload;
 }
 
 /**
@@ -210,6 +193,7 @@ exports.sendOTP = async (req, res) => {
     // Anti-spam simple: 1 OTP par minute
     if (user.otpExpires) {
       const msLeft = user.otpExpires.getTime() - Date.now();
+      // otpExpires = now + 5min. Si on est encore à >4min, c'est qu'on l'a généré il y a <1min.
       if (msLeft > 4 * 60 * 1000) {
         return res.status(429).json({ error: "Veuillez attendre avant de redemander un code." });
       }
@@ -220,9 +204,9 @@ exports.sendOTP = async (req, res) => {
     user.otpExpires = new Date(Date.now() + 5 * 60 * 1000);
     await user.save();
 
+    // On tente l'envoi (et on TRACK si au moins 1 canal a réussi)
     let sentAtLeastOne = false;
     const delivery = { sms: false, email: false };
-    let lastSmsError = null;
 
     // EMAIL
     if (email) {
@@ -239,7 +223,6 @@ exports.sendOTP = async (req, res) => {
     // SMS
     if (finalPhone) {
       if (!twilioClient || !process.env.TWILIO_PHONE_NUMBER) {
-        lastSmsError = { message: "Twilio non configuré (vars manquantes)" };
         console.error(
           "❌ OTP SMS FAILED: Twilio non configuré (TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN/TWILIO_PHONE_NUMBER)"
         );
@@ -250,28 +233,28 @@ exports.sendOTP = async (req, res) => {
             to: finalPhone,
             body: `Votre code de vérification est : ${otp}`,
           });
-
           sentAtLeastOne = true;
           delivery.sms = true;
           console.log("✅ OTP SMS envoyé:", msg.sid, "->", finalPhone);
         } catch (err) {
-          lastSmsError = logTwilioError("❌ OTP SMS FAILED (Twilio):", err);
+          console.error("❌ OTP SMS FAILED:", err?.message || err);
         }
       }
     }
 
+    // Si aucun canal n'a réussi => on le dit au front
     if (!sentAtLeastOne) {
-      // En prod, on reste vague. En dev/staging, on aide à diagnostiquer.
       return res.status(502).json({
         error:
           "Impossible d’envoyer le code pour le moment. Vérifiez la configuration SMS/Email (provider) et réessayez.",
-        ...(isProd ? {} : { delivery, debug: { finalPhone, lastSmsError } }),
       });
     }
 
+    // En prod: ne jamais renvoyer l'OTP
     if (isProd) return res.json({ ok: true });
 
-    return res.json({ ok: true, otp, delivery, debug: { finalPhone, lastSmsError } });
+    // En dev seulement: utile pour debug
+    return res.json({ ok: true, otp, delivery });
   } catch (error) {
     console.error("❌ Erreur envoi OTP :", error);
     return res.status(500).json({ error: "Erreur serveur lors de l'envoi de l'OTP." });
@@ -301,9 +284,9 @@ exports.verifyOTP = async (req, res) => {
     }
 
     if (user.otp !== otp) return res.status(400).json({ error: "Code OTP invalide." });
-    if (user.otpExpires.getTime() < Date.now())
-      return res.status(400).json({ error: "Code OTP expiré." });
+    if (user.otpExpires.getTime() < Date.now()) return res.status(400).json({ error: "Code OTP expiré." });
 
+    // OTP consommé
     user.otp = undefined;
     user.otpExpires = undefined;
 
