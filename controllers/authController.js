@@ -4,8 +4,7 @@ const jwt = require("jsonwebtoken");
 const { sendOTP: sendEmailOTP } = require("../services/emailService");
 const twilio = require("twilio");
 
-// Sur Railway/Prod, dotenv est inutile (et parfois source de confusion).
-// On ne le charge qu'en local.
+// Charger dotenv seulement en local
 if (process.env.NODE_ENV !== "production") {
   // eslint-disable-next-line global-require
   require("dotenv").config();
@@ -20,18 +19,14 @@ const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || "dev-refresh-secret
 // --- Helpers ---
 function normalizePhoneFR(input) {
   if (!input) return null;
-  const raw = String(input).trim().replace(/\s+/g, "");
+  const raw = String(input)
+    .trim()
+    .replace(/[\s\-().]/g, ""); // ✅ plus robuste (enlève espaces/tirets/parenthèses)
 
-  // Déjà en E.164
   if (raw.startsWith("+")) return raw;
-
-  // 00CC...
   if (raw.startsWith("00")) return `+${raw.slice(2)}`;
-
-  // France : 0XXXXXXXXX -> +33XXXXXXXXX
   if (/^0\d{9}$/.test(raw)) return `+33${raw.slice(1)}`;
-
-  // Sinon on renvoie tel quel (à améliorer si multi-pays)
+  if (/^33\d{8,}$/.test(raw)) return `+${raw}`; // ✅ si "33..." sans "+"
   return raw;
 }
 
@@ -39,31 +34,45 @@ function generateOtp() {
   return Math.floor(100000 + Math.random() * 900000).toString();
 }
 
-/**
- * Génère un access token (valable 15 minutes)
- */
-const generateAccessToken = (userId) => jwt.sign({ userId }, JWT_SECRET, { expiresIn: "15m" });
+const generateAccessToken = (userId) =>
+  jwt.sign({ userId }, JWT_SECRET, { expiresIn: "15m" });
 
-/**
- * Génère un refresh token (valable 30 jours)
- */
 const generateRefreshToken = (userId) =>
   jwt.sign({ userId }, JWT_REFRESH_SECRET, { expiresIn: "30d" });
 
-// Client Twilio (SAFE)
+// --- Twilio init ---
 let twilioClient = null;
-try {
+
+function isTwilioConfigured() {
   const sid = process.env.TWILIO_ACCOUNT_SID;
   const token = process.env.TWILIO_AUTH_TOKEN;
+  const from = process.env.TWILIO_PHONE_NUMBER;
+  return Boolean(sid && token && from && String(sid).startsWith("AC"));
+}
 
-  if (sid && token && sid.startsWith("AC")) {
-    twilioClient = twilio(sid, token);
+try {
+  if (isTwilioConfigured()) {
+    twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+    console.log("✅ Twilio activé (Messaging) - from:", process.env.TWILIO_PHONE_NUMBER);
   } else {
-    console.log("⚠️ Twilio désactivé (TWILIO_ACCOUNT_SID invalide ou manquant).");
+    console.log("⚠️ Twilio désactivé (variables manquantes ou invalides).");
   }
 } catch (e) {
   console.log("⚠️ Twilio désactivé (erreur init):", e?.message || e);
   twilioClient = null;
+}
+
+function logTwilioError(prefix, err) {
+  // Twilio errors have: status, code, moreInfo, details
+  const payload = {
+    message: err?.message,
+    status: err?.status,
+    code: err?.code,
+    moreInfo: err?.moreInfo,
+    details: err?.details,
+  };
+  console.error(prefix, payload);
+  return payload;
 }
 
 /**
@@ -72,7 +81,6 @@ try {
 exports.register = async (req, res) => {
   try {
     const { fullName, email, phoneNumber, password } = req.body;
-
     const normalizedPhone = normalizePhoneFR(phoneNumber);
 
     if (!email && !normalizedPhone) {
@@ -187,6 +195,7 @@ exports.sendOTP = async (req, res) => {
       return res.status(400).json({ error: "Email ou téléphone requis pour envoyer un OTP." });
     }
 
+    // Chercher ou créer un utilisateur "light"
     let user = await User.findOne({
       $or: [{ email }, { phoneNumber: finalPhone }],
     });
@@ -199,46 +208,70 @@ exports.sendOTP = async (req, res) => {
     }
 
     // Anti-spam simple: 1 OTP par minute
-    if (user.otpExpires && user.otpExpires.getTime() > Date.now() + 4 * 60 * 1000) {
-      // Si on avait mis 5 minutes, et qu'il reste >4 min, c'est qu'on vient d'en envoyer un
-      return res.status(429).json({ error: "Veuillez attendre avant de redemander un code." });
+    if (user.otpExpires) {
+      const msLeft = user.otpExpires.getTime() - Date.now();
+      if (msLeft > 4 * 60 * 1000) {
+        return res.status(429).json({ error: "Veuillez attendre avant de redemander un code." });
+      }
     }
 
     const otp = generateOtp();
-
     user.otp = otp;
     user.otpExpires = new Date(Date.now() + 5 * 60 * 1000);
     await user.save();
 
-    // Envoi email
+    let sentAtLeastOne = false;
+    const delivery = { sms: false, email: false };
+    let lastSmsError = null;
+
+    // EMAIL
     if (email) {
       try {
         await sendEmailOTP(email, otp);
+        sentAtLeastOne = true;
+        delivery.email = true;
+        console.log("✅ OTP email envoyé à", email);
       } catch (err) {
-        console.error("⚠️ Erreur envoi OTP email :", err);
+        console.error("❌ OTP email FAILED:", err?.message || err);
       }
     }
 
-    // Envoi SMS via Twilio si configuré
-    if (finalPhone && twilioClient && process.env.TWILIO_PHONE_NUMBER) {
-      try {
-        await twilioClient.messages.create({
-          from: process.env.TWILIO_PHONE_NUMBER,
-          to: finalPhone,
-          body: `Votre code de vérification est : ${otp}`,
-        });
-      } catch (err) {
-        console.error("⚠️ Erreur envoi OTP SMS :", err);
+    // SMS
+    if (finalPhone) {
+      if (!twilioClient || !process.env.TWILIO_PHONE_NUMBER) {
+        lastSmsError = { message: "Twilio non configuré (vars manquantes)" };
+        console.error(
+          "❌ OTP SMS FAILED: Twilio non configuré (TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN/TWILIO_PHONE_NUMBER)"
+        );
+      } else {
+        try {
+          const msg = await twilioClient.messages.create({
+            from: process.env.TWILIO_PHONE_NUMBER,
+            to: finalPhone,
+            body: `Votre code de vérification est : ${otp}`,
+          });
+
+          sentAtLeastOne = true;
+          delivery.sms = true;
+          console.log("✅ OTP SMS envoyé:", msg.sid, "->", finalPhone);
+        } catch (err) {
+          lastSmsError = logTwilioError("❌ OTP SMS FAILED (Twilio):", err);
+        }
       }
-    } else if (finalPhone) {
-      console.log(`📱 OTP ${otp} pour ${finalPhone} (Twilio non configuré)`);
     }
 
-    // En prod: ne jamais renvoyer l'OTP
+    if (!sentAtLeastOne) {
+      // En prod, on reste vague. En dev/staging, on aide à diagnostiquer.
+      return res.status(502).json({
+        error:
+          "Impossible d’envoyer le code pour le moment. Vérifiez la configuration SMS/Email (provider) et réessayez.",
+        ...(isProd ? {} : { delivery, debug: { finalPhone, lastSmsError } }),
+      });
+    }
+
     if (isProd) return res.json({ ok: true });
 
-    // En dev seulement
-    return res.json({ ok: true, otp });
+    return res.json({ ok: true, otp, delivery, debug: { finalPhone, lastSmsError } });
   } catch (error) {
     console.error("❌ Erreur envoi OTP :", error);
     return res.status(500).json({ error: "Erreur serveur lors de l'envoi de l'OTP." });
@@ -268,9 +301,9 @@ exports.verifyOTP = async (req, res) => {
     }
 
     if (user.otp !== otp) return res.status(400).json({ error: "Code OTP invalide." });
-    if (user.otpExpires.getTime() < Date.now()) return res.status(400).json({ error: "Code OTP expiré." });
+    if (user.otpExpires.getTime() < Date.now())
+      return res.status(400).json({ error: "Code OTP expiré." });
 
-    // OTP consommé
     user.otp = undefined;
     user.otpExpires = undefined;
 
@@ -302,7 +335,6 @@ exports.verifyOTP = async (req, res) => {
 exports.refreshToken = async (req, res) => {
   try {
     const { refreshToken: token } = req.body;
-
     if (!token) return res.status(401).json({ error: "Refresh token manquant." });
 
     let payload;
