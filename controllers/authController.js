@@ -6,24 +6,30 @@ const twilio = require("twilio");
 
 // Charger dotenv seulement en local
 if (process.env.NODE_ENV !== "production") {
-  // eslint-disable-next-line global-require
   require("dotenv").config();
 }
 
 const isProd = process.env.NODE_ENV === "production";
 
-// Secrets JWT
+// JWT
 const JWT_SECRET = process.env.JWT_SECRET || "dev-secret";
 const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || "dev-refresh-secret";
 
-// --- Helpers ---
-function normalizePhoneFR(input) {
+// ======================
+// HELPERS
+// ======================
+function normalizePhone(input) {
   if (!input) return null;
-  const raw = String(input).trim().replace(/\s+/g, "");
+
+  const raw = String(input).trim().replace(/[\s\-().]/g, "");
 
   if (raw.startsWith("+")) return raw;
   if (raw.startsWith("00")) return `+${raw.slice(2)}`;
+
+  // France
   if (/^0\d{9}$/.test(raw)) return `+33${raw.slice(1)}`;
+  if (/^33\d{8,}$/.test(raw)) return `+${raw}`;
+
   return raw;
 }
 
@@ -37,69 +43,71 @@ const generateAccessToken = (userId) =>
 const generateRefreshToken = (userId) =>
   jwt.sign({ userId }, JWT_REFRESH_SECRET, { expiresIn: "30d" });
 
-// --- Twilio init ---
+// ======================
+// TWILIO INIT
+// ======================
 let twilioClient = null;
+
 function isTwilioConfigured() {
-  const sid = process.env.TWILIO_ACCOUNT_SID;
-  const token = process.env.TWILIO_AUTH_TOKEN;
-  const from = process.env.TWILIO_PHONE_NUMBER;
-  return Boolean(sid && token && from && sid.startsWith("AC"));
+  return (
+    process.env.TWILIO_ACCOUNT_SID &&
+    process.env.TWILIO_AUTH_TOKEN &&
+    process.env.TWILIO_PHONE_NUMBER &&
+    process.env.TWILIO_ACCOUNT_SID.startsWith("AC")
+  );
 }
 
 try {
   if (isTwilioConfigured()) {
-    twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-    console.log("✅ Twilio activé");
+    twilioClient = twilio(
+      process.env.TWILIO_ACCOUNT_SID,
+      process.env.TWILIO_AUTH_TOKEN
+    );
+    console.log("✅ Twilio activé - from:", process.env.TWILIO_PHONE_NUMBER);
   } else {
-    console.log("⚠️ Twilio désactivé (variables manquantes ou invalides).");
+    console.log("⚠️ Twilio désactivé (variables manquantes)");
   }
 } catch (e) {
-  console.log("⚠️ Twilio désactivé (erreur init):", e?.message || e);
+  console.error("❌ Erreur init Twilio:", e);
   twilioClient = null;
 }
 
-/**
- * Inscription email / téléphone + mot de passe
- */
+// ======================
+// REGISTER
+// ======================
 exports.register = async (req, res) => {
   try {
     const { fullName, email, phoneNumber, password } = req.body;
-    const normalizedPhone = normalizePhoneFR(phoneNumber);
+    const phone = normalizePhone(phoneNumber);
 
-    if (!email && !normalizedPhone) {
-      return res.status(400).json({ error: "Email ou numéro de téléphone requis." });
-    }
-    if (!password) {
+    if (!email && !phone)
+      return res.status(400).json({ error: "Email ou téléphone requis." });
+    if (!password)
       return res.status(400).json({ error: "Mot de passe requis." });
-    }
 
     const existing = await User.findOne({
-      $or: [{ email }, { phoneNumber: normalizedPhone }],
+      $or: [{ email }, { phoneNumber: phone }],
     });
 
     if (existing && existing.password) {
-      return res.status(409).json({
-        error: "Un utilisateur existe déjà avec cet email ou téléphone.",
-      });
+      return res.status(409).json({ error: "Utilisateur déjà existant." });
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    let user;
-    if (existing) {
-      existing.fullName = fullName || existing.fullName;
-      existing.email = email || existing.email;
-      existing.phoneNumber = normalizedPhone || existing.phoneNumber;
-      existing.password = hashedPassword;
-      user = await existing.save();
-    } else {
-      user = await User.create({
-        fullName,
-        email,
-        phoneNumber: normalizedPhone,
-        password: hashedPassword,
-      });
-    }
+    const user = existing
+      ? Object.assign(existing, {
+          fullName: fullName || existing.fullName,
+          email: email || existing.email,
+          phoneNumber: phone || existing.phoneNumber,
+          password: hashedPassword,
+        })
+      : await User.create({
+          fullName,
+          email,
+          phoneNumber: phone,
+          password: hashedPassword,
+        });
 
     const accessToken = generateAccessToken(user._id);
     const refreshToken = generateRefreshToken(user._id);
@@ -116,33 +124,33 @@ exports.register = async (req, res) => {
       accessToken,
       refreshToken,
     });
-  } catch (error) {
-    console.error("❌ Erreur inscription :", error);
-    return res.status(500).json({ error: "Erreur serveur lors de l'inscription." });
+  } catch (e) {
+    console.error("❌ Register error:", e);
+    return res.status(500).json({ error: "Erreur serveur." });
   }
 };
 
-/**
- * Login email / téléphone + mot de passe
- */
+// ======================
+// LOGIN
+// ======================
 exports.login = async (req, res) => {
   try {
     const { email, phoneNumber, password } = req.body;
-    const normalizedPhone = normalizePhoneFR(phoneNumber);
+    const phone = normalizePhone(phoneNumber);
 
-    if (!password) return res.status(400).json({ error: "Mot de passe requis." });
-    if (!email && !normalizedPhone) {
-      return res.status(400).json({ error: "Email ou numéro de téléphone requis." });
-    }
+    if (!password)
+      return res.status(400).json({ error: "Mot de passe requis." });
 
     const user = await User.findOne({
-      $or: [{ email }, { phoneNumber: normalizedPhone }],
+      $or: [{ email }, { phoneNumber: phone }],
     });
 
-    if (!user || !user.password) return res.status(400).json({ error: "Identifiants invalides." });
+    if (!user || !user.password)
+      return res.status(400).json({ error: "Identifiants invalides." });
 
-    const match = await bcrypt.compare(password, user.password);
-    if (!match) return res.status(400).json({ error: "Identifiants invalides." });
+    const ok = await bcrypt.compare(password, user.password);
+    if (!ok)
+      return res.status(400).json({ error: "Identifiants invalides." });
 
     const accessToken = generateAccessToken(user._id);
     const refreshToken = generateRefreshToken(user._id);
@@ -159,26 +167,23 @@ exports.login = async (req, res) => {
       accessToken,
       refreshToken,
     });
-  } catch (error) {
-    console.error("❌ Erreur login :", error);
-    return res.status(500).json({ error: "Erreur serveur lors de la connexion." });
+  } catch (e) {
+    console.error("❌ Login error:", e);
+    return res.status(500).json({ error: "Erreur serveur." });
   }
 };
 
-/**
- * Envoi OTP (email + SMS possible)
- * Body attendu : { email?, phoneNumber? ou phone? }
- */
+// ======================
+// SEND OTP
+// ======================
 exports.sendOTP = async (req, res) => {
   try {
     const { email, phoneNumber, phone } = req.body;
-    const finalPhone = normalizePhoneFR(phoneNumber || phone);
+    const finalPhone = normalizePhone(phoneNumber || phone);
 
-    if (!email && !finalPhone) {
-      return res.status(400).json({ error: "Email ou téléphone requis pour envoyer un OTP." });
-    }
+    if (!email && !finalPhone)
+      return res.status(400).json({ error: "Email ou téléphone requis." });
 
-    // Chercher ou créer un utilisateur "light"
     let user = await User.findOne({
       $or: [{ email }, { phoneNumber: finalPhone }],
     });
@@ -190,104 +195,90 @@ exports.sendOTP = async (req, res) => {
       });
     }
 
-    // Anti-spam simple: 1 OTP par minute
+    // Rate limit 1/min
     if (user.otpExpires) {
       const msLeft = user.otpExpires.getTime() - Date.now();
-      // otpExpires = now + 5min. Si on est encore à >4min, c'est qu'on l'a généré il y a <1min.
-      if (msLeft > 4 * 60 * 1000) {
-        return res.status(429).json({ error: "Veuillez attendre avant de redemander un code." });
-      }
+      if (msLeft > 4 * 60 * 1000)
+        return res.status(429).json({ error: "Veuillez patienter." });
     }
 
     const otp = generateOtp();
-    user.otp = otp;
+    user.otpHash = await bcrypt.hash(otp, 10);
     user.otpExpires = new Date(Date.now() + 5 * 60 * 1000);
     await user.save();
 
-    // On tente l'envoi (et on TRACK si au moins 1 canal a réussi)
-    let sentAtLeastOne = false;
-    const delivery = { sms: false, email: false };
+    let sent = false;
 
-    // EMAIL
     if (email) {
       try {
         await sendEmailOTP(email, otp);
-        sentAtLeastOne = true;
-        delivery.email = true;
-        console.log("✅ OTP email envoyé à", email);
-      } catch (err) {
-        console.error("❌ OTP email FAILED:", err?.message || err);
+        sent = true;
+      } catch (e) {
+        console.error("❌ Email OTP error:", e);
       }
     }
 
-    // SMS
-    if (finalPhone) {
-      if (!twilioClient || !process.env.TWILIO_PHONE_NUMBER) {
-        console.error(
-          "❌ OTP SMS FAILED: Twilio non configuré (TWILIO_ACCOUNT_SID/TWILIO_AUTH_TOKEN/TWILIO_PHONE_NUMBER)"
-        );
-      } else {
-        try {
-          const msg = await twilioClient.messages.create({
-            from: process.env.TWILIO_PHONE_NUMBER,
-            to: finalPhone,
-            body: `Votre code de vérification est : ${otp}`,
-          });
-          sentAtLeastOne = true;
-          delivery.sms = true;
-          console.log("✅ OTP SMS envoyé:", msg.sid, "->", finalPhone);
-        } catch (err) {
-          console.error("❌ OTP SMS FAILED:", err?.message || err);
-        }
+    if (finalPhone && twilioClient) {
+      try {
+        await twilioClient.messages.create({
+          from: process.env.TWILIO_PHONE_NUMBER,
+          to: finalPhone,
+          body: `Votre code de vérification est : ${otp}`,
+        });
+        sent = true;
+      } catch (e) {
+        console.error("❌ SMS OTP error:", {
+          message: e.message,
+          code: e.code,
+          status: e.status,
+        });
       }
     }
 
-    // Si aucun canal n'a réussi => on le dit au front
-    if (!sentAtLeastOne) {
-      return res.status(502).json({
-        error:
-          "Impossible d’envoyer le code pour le moment. Vérifiez la configuration SMS/Email (provider) et réessayez.",
-      });
+    if (!sent) {
+      user.otpHash = undefined;
+      user.otpExpires = undefined;
+      await user.save();
+      return res.status(502).json({ error: "Impossible d’envoyer le code." });
     }
 
-    // En prod: ne jamais renvoyer l'OTP
-    if (isProd) return res.json({ ok: true });
-
-    // En dev seulement: utile pour debug
-    return res.json({ ok: true, otp, delivery });
-  } catch (error) {
-    console.error("❌ Erreur envoi OTP :", error);
-    return res.status(500).json({ error: "Erreur serveur lors de l'envoi de l'OTP." });
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("❌ sendOTP error:", e);
+    return res.status(500).json({ error: "Erreur serveur." });
   }
 };
 
-/**
- * Vérification OTP
- * Body attendu : { email?, phoneNumber? ou phone?, otp }
- */
+// ======================
+// VERIFY OTP
+// ======================
 exports.verifyOTP = async (req, res) => {
   try {
     const { email, phoneNumber, phone, otp } = req.body;
-    const finalPhone = normalizePhoneFR(phoneNumber || phone);
+    const finalPhone = normalizePhone(phoneNumber || phone);
 
-    if (!otp) return res.status(400).json({ error: "Code OTP requis." });
-    if (!email && !finalPhone) {
-      return res.status(400).json({ error: "Email ou téléphone requis pour vérifier l'OTP." });
-    }
+    if (!otp)
+      return res.status(400).json({ error: "OTP requis." });
 
     const user = await User.findOne({
       $or: [{ email }, { phoneNumber: finalPhone }],
     });
 
-    if (!user || !user.otp || !user.otpExpires) {
-      return res.status(400).json({ error: "Aucun OTP en attente pour cet utilisateur." });
+    if (!user || !user.otpHash || !user.otpExpires)
+      return res.status(400).json({ error: "Aucun OTP en attente." });
+
+    if (user.otpExpires < Date.now()) {
+      user.otpHash = undefined;
+      user.otpExpires = undefined;
+      await user.save();
+      return res.status(400).json({ error: "OTP expiré." });
     }
 
-    if (user.otp !== otp) return res.status(400).json({ error: "Code OTP invalide." });
-    if (user.otpExpires.getTime() < Date.now()) return res.status(400).json({ error: "Code OTP expiré." });
+    const valid = await bcrypt.compare(otp, user.otpHash);
+    if (!valid)
+      return res.status(400).json({ error: "OTP invalide." });
 
-    // OTP consommé
-    user.otp = undefined;
+    user.otpHash = undefined;
     user.otpExpires = undefined;
 
     const accessToken = generateAccessToken(user._id);
@@ -305,37 +296,30 @@ exports.verifyOTP = async (req, res) => {
       accessToken,
       refreshToken,
     });
-  } catch (error) {
-    console.error("❌ Erreur vérification OTP :", error);
-    return res.status(500).json({ error: "Erreur serveur lors de la vérification de l'OTP." });
+  } catch (e) {
+    console.error("❌ verifyOTP error:", e);
+    return res.status(500).json({ error: "Erreur serveur." });
   }
 };
 
-/**
- * Refresh token → nouveau access token
- * Body : { refreshToken }
- */
+// ======================
+// REFRESH TOKEN
+// ======================
 exports.refreshToken = async (req, res) => {
   try {
-    const { refreshToken: token } = req.body;
-    if (!token) return res.status(401).json({ error: "Refresh token manquant." });
+    const { refreshToken } = req.body;
+    if (!refreshToken)
+      return res.status(401).json({ error: "Refresh token manquant." });
 
-    let payload;
-    try {
-      payload = jwt.verify(token, JWT_REFRESH_SECRET);
-    } catch (err) {
-      return res.status(403).json({ error: "Refresh token invalide ou expiré." });
-    }
-
+    const payload = jwt.verify(refreshToken, JWT_REFRESH_SECRET);
     const user = await User.findById(payload.userId);
-    if (!user || user.refreshToken !== token) {
-      return res.status(403).json({ error: "Refresh token invalide." });
-    }
+
+    if (!user || user.refreshToken !== refreshToken)
+      return res.status(403).json({ error: "Token invalide." });
 
     const newAccessToken = generateAccessToken(user._id);
     return res.json({ accessToken: newAccessToken });
-  } catch (error) {
-    console.error("❌ Erreur lors du rafraîchissement du token :", error);
-    return res.status(500).json({ error: "Erreur serveur lors du rafraîchissement du token." });
+  } catch (e) {
+    return res.status(403).json({ error: "Refresh token invalide." });
   }
 };
